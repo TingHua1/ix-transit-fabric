@@ -120,6 +120,31 @@ func TestSyncNodeQueuesOnlyActiveRules(t *testing.T) {
 	}
 }
 
+func TestQueueCommandAssignsDistinctIDsForSameNode(t *testing.T) {
+	db := testManagementDB(t, "ixcontrolcommandids")
+	defer db.Close()
+
+	firstID, err := queueCommandWithDependencies(db, "ing", "disable_rule", map[string]string{"rule_id": "first"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := queueCommandWithDependencies(db, "ing", "disable_rule", map[string]string{"rule_id": "second"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstID == secondID {
+		t.Fatalf("same-node commands received duplicate ID %q", firstID)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM commands WHERE id IN (?, ?)`, firstID, secondID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected both commands to be stored, got %d", count)
+	}
+}
+
 func TestLinkAggregationAndTwoNodeExpansion(t *testing.T) {
 	db := testManagementDB(t, "ixcontrollinksaggregate")
 	defer db.Close()

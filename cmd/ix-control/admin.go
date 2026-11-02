@@ -7,8 +7,13 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"sync/atomic"
 	"time"
 )
+
+// commandSequence distinguishes commands created during the same clock tick.
+// It is process-wide because command IDs share one SQLite commands table.
+var commandSequence uint64
 
 type AdminRequest struct {
 	Action string          `json:"action"`
@@ -171,7 +176,7 @@ func queueCommandTx(tx *sql.Tx, nodeID, typ string, body any, dependsOn []string
 	if err != nil {
 		return "", err
 	}
-	id := fmt.Sprintf("cmd-%d-%s", time.Now().UnixNano(), nodeID)
+	id := fmt.Sprintf("cmd-%d-%d-%s", time.Now().UnixNano(), atomic.AddUint64(&commandSequence, 1), nodeID)
 	deps, _ := json.Marshal(dependsOn)
 	if typ != "apply_ruleset" {
 		_, err = tx.Exec(`INSERT INTO commands(id,node_id,type,body,depends_on,state,created_at) VALUES(?,?,?,?,?,'pending',?)`, id, nodeID, typ, string(b), string(deps), time.Now().Unix())
