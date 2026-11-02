@@ -26,7 +26,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const protocolVersion = 1
+const protocolVersion = 2
 
 type Message struct {
 	Type string          `json:"type"`
@@ -34,8 +34,11 @@ type Message struct {
 }
 
 type Hello struct {
-	NodeID string `json:"node_id"`
-	Token  string `json:"token"`
+	NodeID              string `json:"node_id"`
+	Token               string `json:"token"`
+	RulesetVersion      int64  `json:"ruleset_version,omitempty"`
+	RulesetHash         string `json:"ruleset_hash,omitempty"`
+	RulesetVersionGuard bool   `json:"ruleset_version_guard"`
 }
 
 type Usage struct {
@@ -48,10 +51,14 @@ type Usage struct {
 }
 
 type Command struct {
-	ID     string          `json:"id"`
-	NodeID string          `json:"node_id"`
-	Type   string          `json:"type"`
-	Body   json.RawMessage `json:"body"`
+	ID             string          `json:"id"`
+	NodeID         string          `json:"node_id"`
+	Type           string          `json:"type"`
+	Body           json.RawMessage `json:"body"`
+	DependsOn      []string        `json:"depends_on,omitempty"`
+	RulesetVersion int64           `json:"ruleset_version,omitempty"`
+	RulesetHash    string          `json:"ruleset_hash,omitempty"`
+	Detail         string          `json:"detail,omitempty"`
 }
 
 type CommandAck struct {
@@ -113,12 +120,40 @@ CREATE TABLE IF NOT EXISTS commands (
   type TEXT NOT NULL,
   body TEXT NOT NULL DEFAULT '{}',
   state TEXT NOT NULL DEFAULT 'pending',
-  detail TEXT NOT NULL DEFAULT '',
+   depends_on TEXT NOT NULL DEFAULT '[]',
+   ruleset_version INTEGER NOT NULL DEFAULT 0,
+   ruleset_hash TEXT NOT NULL DEFAULT '',
+   detail TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   acknowledged_at INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS node_ruleset_state (
+   node_id TEXT PRIMARY KEY,
+   next_version INTEGER NOT NULL DEFAULT 0,
+   desired_version INTEGER NOT NULL DEFAULT 0,
+   desired_hash TEXT NOT NULL DEFAULT '',
+   applied_version INTEGER NOT NULL DEFAULT 0,
+   applied_hash TEXT NOT NULL DEFAULT ''
+);
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	// Existing installations predate dependency and ruleset metadata. SQLite has
+	// no ADD COLUMN IF NOT EXISTS, so duplicate-column errors are deliberately
+	// ignored after the idempotent table creation above.
+	for _, statement := range []string{
+		`ALTER TABLE commands ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE commands ADD COLUMN ruleset_version INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE commands ADD COLUMN ruleset_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE commands ADD COLUMN detail TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE commands ADD COLUMN acknowledged_at INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, e := db.Exec(statement); e != nil && !strings.Contains(e.Error(), "duplicate column name") {
+			return e
+		}
+	}
+	return nil
 }
 
 func (s *Server) authenticate(h Hello) error {
@@ -155,6 +190,13 @@ func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
 	var hello Hello
 	if json.Unmarshal(first.Data, &hello) != nil || s.authenticate(hello) != nil {
 		_ = conn.WriteJSON(Message{Type: "error", Data: json.RawMessage(`"authentication failed"`)})
+		return
+	}
+	if !hello.RulesetVersionGuard {
+		_ = conn.WriteJSON(Message{Type: "error", Data: json.RawMessage(`"protocol v2 ruleset_version_guard capability required"`)})
+		return
+	}
+	if err := s.recordHello(hello); err != nil {
 		return
 	}
 	if err := conn.WriteJSON(Message{Type: "welcome", Data: json.RawMessage(fmt.Sprintf(`{"protocol":%d}`, protocolVersion))}); err != nil {
@@ -199,13 +241,12 @@ func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
 			if a.OK {
 				state = "done"
 			}
-			result, err := s.db.Exec(`UPDATE commands SET state=?, detail=?, acknowledged_at=? WHERE id=? AND node_id=? AND state='pending'`, state, a.Detail, time.Now().Unix(), a.ID, hello.NodeID)
+			accepted, err := s.ackCommand(hello.NodeID, a.ID, state, a.Detail)
 			if err != nil {
 				_ = conn.WriteJSON(Message{Type: "error", Data: json.RawMessage(`"command acknowledgement failed"`)})
 				continue
 			}
-			n, _ := result.RowsAffected()
-			_ = conn.WriteJSON(Message{Type: "command_ack", Data: mustJSON(map[string]any{"id": a.ID, "accepted": n == 1})})
+			_ = conn.WriteJSON(Message{Type: "command_ack", Data: mustJSON(map[string]any{"id": a.ID, "accepted": accepted})})
 		default:
 			_ = conn.WriteJSON(Message{Type: "error", Data: json.RawMessage(`"unknown message"`)})
 		}
@@ -213,7 +254,15 @@ func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pendingCommands(nodeID string) ([]Command, error) {
-	rows, err := s.db.Query(`SELECT id,node_id,type,body FROM commands WHERE node_id=? AND state='pending' ORDER BY created_at,id LIMIT 100`, nodeID)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err := terminateBlockedCommands(tx); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(`SELECT id,node_id,type,body,depends_on,ruleset_version,ruleset_hash,detail FROM commands WHERE node_id=? AND state='pending' ORDER BY created_at,id`, nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -222,13 +271,124 @@ func (s *Server) pendingCommands(nodeID string) ([]Command, error) {
 	for rows.Next() {
 		var c Command
 		var body string
-		if err := rows.Scan(&c.ID, &c.NodeID, &c.Type, &body); err != nil {
+		var deps string
+		if err := rows.Scan(&c.ID, &c.NodeID, &c.Type, &body, &deps, &c.RulesetVersion, &c.RulesetHash, &c.Detail); err != nil {
 			return nil, err
 		}
 		c.Body = json.RawMessage(body)
-		out = append(out, c)
+		if json.Unmarshal([]byte(deps), &c.DependsOn) != nil {
+			continue
+		}
+		if commandDependenciesDone(tx, c.DependsOn) {
+			out = append(out, c)
+		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, tx.Commit()
+}
+
+func (s *Server) ackCommand(nodeID, id, state, detail string) (bool, error) {
+	if state != "done" && state != "failed" {
+		return false, errors.New("invalid acknowledgement state")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`UPDATE commands SET state=?, detail=?, acknowledged_at=? WHERE id=? AND node_id=? AND state='pending'`, state, detail, time.Now().Unix(), id, nodeID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		var current string
+		if err = tx.QueryRow(`SELECT state FROM commands WHERE id=? AND node_id=?`, id, nodeID).Scan(&current); err != nil {
+			return false, err
+		}
+	}
+	if err := terminateBlockedCommands(tx); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+func (s *Server) recordHello(h Hello) error {
+	if h.RulesetVersion < 0 {
+		return errors.New("invalid ruleset version")
+	}
+	_, err := s.db.Exec(`INSERT INTO node_ruleset_state(node_id,applied_version,applied_hash) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET applied_version=CASE WHEN excluded.applied_version>applied_version THEN excluded.applied_version ELSE applied_version END, applied_hash=CASE WHEN excluded.applied_version>=applied_version THEN excluded.applied_hash ELSE applied_hash END`, h.NodeID, h.RulesetVersion, h.RulesetHash)
+	return err
+}
+
+// terminateBlockedCommands reaches a fixed point, so a failed transit command
+// also terminates ingress commands which depend on a command already cancelled.
+func terminateBlockedCommands(tx *sql.Tx) error {
+	for {
+		rows, err := tx.Query(`SELECT id,depends_on FROM commands WHERE state='pending'`)
+		if err != nil {
+			return err
+		}
+		var doomed []struct{ id, state string }
+		for rows.Next() {
+			var id, raw string
+			if err := rows.Scan(&id, &raw); err != nil {
+				rows.Close()
+				return err
+			}
+			var deps []string
+			if json.Unmarshal([]byte(raw), &deps) != nil {
+				doomed = append(doomed, struct{ id, state string }{id, "failed"})
+				continue
+			}
+			for _, dep := range deps {
+				var state string
+				err := tx.QueryRow(`SELECT state FROM commands WHERE id=?`, dep).Scan(&state)
+				if errors.Is(err, sql.ErrNoRows) {
+					doomed = append(doomed, struct{ id, state string }{id, "failed"})
+					break
+				}
+				if err != nil {
+					rows.Close()
+					return err
+				}
+				if state == "superseded" {
+					doomed = append(doomed, struct{ id, state string }{id, "superseded"})
+					break
+				}
+				if state == "failed" || state == "cancelled" {
+					doomed = append(doomed, struct{ id, state string }{id, "cancelled"})
+					break
+				}
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if len(doomed) == 0 {
+			return nil
+		}
+		for _, d := range doomed {
+			if _, err := tx.Exec(`UPDATE commands SET state=?,detail=?,acknowledged_at=? WHERE id=? AND state='pending'`, d.state, "blocked by dependency", time.Now().Unix(), d.id); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func commandDependenciesDone(tx *sql.Tx, deps []string) bool {
+	for _, dep := range deps {
+		var state string
+		if tx.QueryRow(`SELECT state FROM commands WHERE id=?`, dep).Scan(&state) != nil || state != "done" {
+			return false
+		}
+	}
+	return true
 }
 
 func mustJSON(v any) json.RawMessage { b, _ := json.Marshal(v); return b }
@@ -244,7 +404,7 @@ func runServer(addr, database string) {
 	must(http.ListenAndServe(addr, nil))
 }
 
-func runAgent(serverURL, nodeID, token, tokenFile, usageFile, applyHook string) {
+func runAgent(serverURL, nodeID, token, tokenFile, usageFile, applyHook, rulesetState string) {
 	if tokenFile != "" {
 		b, err := os.ReadFile(tokenFile)
 		if err != nil {
@@ -262,7 +422,12 @@ func runAgent(serverURL, nodeID, token, tokenFile, usageFile, applyHook string) 
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		if err := conn.WriteJSON(Message{Type: "hello", Data: mustJSON(Hello{NodeID: nodeID, Token: token})}); err != nil {
+		hello := Hello{NodeID: nodeID, Token: token, RulesetVersionGuard: true}
+		if state, err := loadRulesetState(rulesetState); err == nil {
+			hello.RulesetVersion = state.Version
+			hello.RulesetHash = state.Hash
+		}
+		if err := conn.WriteJSON(Message{Type: "hello", Data: mustJSON(hello)}); err != nil {
 			conn.Close()
 			continue
 		}
@@ -273,7 +438,7 @@ func runAgent(serverURL, nodeID, token, tokenFile, usageFile, applyHook string) 
 			continue
 		}
 		log.Printf("connected to control-plane as %s", nodeID)
-		if err := agentSession(conn, nodeID, usageFile, applyHook); err != nil {
+		if err := agentSession(conn, nodeID, usageFile, applyHook, rulesetState); err != nil {
 			log.Printf("agent reconnect: %v", err)
 		}
 		conn.Close()
@@ -283,7 +448,7 @@ func runAgent(serverURL, nodeID, token, tokenFile, usageFile, applyHook string) 
 
 // Usage input is newline-delimited JSON Usage objects. Producers append only
 // deltas, with a monotonic sequence per node/rule. Accepted entries are removed.
-func agentSession(conn *websocket.Conn, nodeID, usageFile, applyHook string) error {
+func agentSession(conn *websocket.Conn, nodeID, usageFile, applyHook, rulesetState string) error {
 	tick := time.NewTicker(30 * time.Second)
 	defer tick.Stop()
 	for {
@@ -312,7 +477,7 @@ func agentSession(conn *websocket.Conn, nodeID, usageFile, applyHook string) err
 				var cs []Command
 				_ = json.Unmarshal(reply.Data, &cs)
 				for _, c := range cs {
-					ok, detail := applyCommand(applyHook, c)
+					ok, detail := applyAgentCommand(applyHook, rulesetState, c)
 					if err := conn.WriteJSON(Message{Type: "command_ack", Data: mustJSON(CommandAck{ID: c.ID, NodeID: nodeID, OK: ok, Detail: detail})}); err != nil {
 						return err
 					}
@@ -327,6 +492,13 @@ func agentSession(conn *websocket.Conn, nodeID, usageFile, applyHook string) err
 			}
 		}
 	}
+}
+
+func applyAgentCommand(hook, rulesetState string, c Command) (bool, string) {
+	if c.Type == "apply_ruleset" {
+		return applyPersistedRulesetCommand(rulesetState, c)
+	}
+	return applyCommand(hook, c)
 }
 
 // The controller cannot select a shell command. An operator may configure one
@@ -408,7 +580,7 @@ func main() {
 		return
 	}
 	if *mode == "agent" {
-		runAgent(*url, *node, *token, *tokenFile, *usage, *applyHook)
+		runAgent(*url, *node, *token, *tokenFile, *usage, *applyHook, *rulesetState)
 		return
 	}
 	if *mode == "nft" {

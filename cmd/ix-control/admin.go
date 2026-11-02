@@ -148,13 +148,63 @@ func activeUser(db *sql.DB, userID string, now int64) (bool, error) {
 	return true, nil
 }
 func queueCommand(db *sql.DB, nodeID, typ string, body any) error {
+	_, err := queueCommandWithDependencies(db, nodeID, typ, body, nil)
+	return err
+}
+
+func queueCommandWithDependencies(db *sql.DB, nodeID, typ string, body any, dependsOn []string) (string, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	id, err := queueCommandTx(tx, nodeID, typ, body, dependsOn)
+	if err != nil {
+		return "", err
+	}
+	return id, tx.Commit()
+}
+
+func queueCommandTx(tx *sql.Tx, nodeID, typ string, body any, dependsOn []string) (string, error) {
 	b, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return "", err
 	}
 	id := fmt.Sprintf("cmd-%d-%s", time.Now().UnixNano(), nodeID)
-	_, err = db.Exec(`INSERT INTO commands(id,node_id,type,body,state,created_at) VALUES(?,?,?,?, 'pending',?)`, id, nodeID, typ, string(b), time.Now().Unix())
-	return err
+	deps, _ := json.Marshal(dependsOn)
+	if typ != "apply_ruleset" {
+		_, err = tx.Exec(`INSERT INTO commands(id,node_id,type,body,depends_on,state,created_at) VALUES(?,?,?,?,?,'pending',?)`, id, nodeID, typ, string(b), string(deps), time.Now().Unix())
+		return id, err
+	}
+	rs, ok := body.(Ruleset)
+	if !ok {
+		return "", errors.New("apply_ruleset body must be Ruleset")
+	}
+	hash, err := rulesetHash(rs)
+	if err != nil {
+		return "", err
+	}
+	if _, err = tx.Exec(`INSERT OR IGNORE INTO node_ruleset_state(node_id) VALUES(?)`, nodeID); err != nil {
+		return "", err
+	}
+	var next int64
+	if err = tx.QueryRow(`SELECT next_version FROM node_ruleset_state WHERE node_id=?`, nodeID).Scan(&next); err != nil {
+		return "", err
+	}
+	version := next + 1
+	if _, err = tx.Exec(`UPDATE commands SET state='superseded',detail='superseded by newer full ruleset',acknowledged_at=? WHERE node_id=? AND type='apply_ruleset' AND state='pending'`, time.Now().Unix(), nodeID); err != nil {
+		return "", err
+	}
+	if _, err = tx.Exec(`UPDATE node_ruleset_state SET next_version=?,desired_version=?,desired_hash=? WHERE node_id=?`, version, version, hash, nodeID); err != nil {
+		return "", err
+	}
+	if _, err = tx.Exec(`INSERT INTO commands(id,node_id,type,body,depends_on,ruleset_version,ruleset_hash,state,created_at) VALUES(?,?,?,?,?,?,?,'pending',?)`, id, nodeID, typ, string(b), string(deps), version, hash, time.Now().Unix()); err != nil {
+		return "", err
+	}
+	if err = terminateBlockedCommands(tx); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func transitRuleID(linkID string) string { return "t-" + linkID }
@@ -314,7 +364,30 @@ func validateLink(db *sql.DB, l LinkSpec) error {
 	if exists == 0 {
 		return errors.New("unknown link user")
 	}
+	if err := validateGlobalRuleID(db, l.ID, "link", l.ID); err != nil {
+		return err
+	}
+	if err := validateGlobalRuleID(db, transitRuleID(l.ID), "link", l.ID); err != nil {
+		return err
+	}
 	return validateLinkPortConflicts(db, l)
+}
+
+func validateGlobalRuleID(db *sql.DB, id, ownerType, ownerID string) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM managed_rules WHERE rule_id=?`, id).Scan(&count); err != nil {
+		return err
+	}
+	if count != 0 && !(ownerType == "managed" && ownerID == id) {
+		return fmt.Errorf("rule id %s conflicts with managed rule", id)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM links WHERE (id=? OR 't-' || id=?) AND id<>?`, id, id, ownerID).Scan(&count); err != nil {
+		return err
+	}
+	if count != 0 {
+		return fmt.Errorf("rule id %s conflicts with link", id)
+	}
+	return nil
 }
 
 func syncUserNodes(db *sql.DB, userID string) error {
@@ -339,6 +412,86 @@ UNION SELECT transit_node_id FROM links WHERE user_id=?
 		return err
 	}
 	return syncNodesTransitFirst(db, ids...)
+}
+
+func syncUserNodesTx(tx *sql.Tx, userID string) error {
+	rows, err := tx.Query(`SELECT DISTINCT node_id FROM (
+SELECT node_id FROM managed_rules WHERE user_id=?
+UNION SELECT ingress_node_id FROM links WHERE user_id=?
+UNION SELECT transit_node_id FROM links WHERE user_id=?
+) ORDER BY node_id`, userID, userID, userID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return syncNodesTransitFirstTx(tx, ids, nil)
+}
+
+func upsertUser(db *sql.DB, u UserSpec) error {
+	if err := validateUser(u); err != nil {
+		return err
+	}
+	if u.BillingMode == "" {
+		u.BillingMode = "both"
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	enabled := 0
+	if u.Enabled {
+		enabled = 1
+	}
+	if _, err := tx.Exec(`INSERT INTO users(user_id,enabled,expires_at,quota_bytes,billing_mode) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled,expires_at=excluded.expires_at,quota_bytes=excluded.quota_bytes,billing_mode=excluded.billing_mode`, u.ID, enabled, u.ExpiresAt, u.QuotaBytes, u.BillingMode); err != nil {
+		return err
+	}
+	if err := syncUserNodesTx(tx, u.ID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func upsertManagedRule(db *sql.DB, r ManagedRule) error {
+	if err := validateRuleset(Ruleset{Role: "ingress", Rules: []RuleSpec{r.RuleSpec}}); err != nil {
+		return err
+	}
+	if r.NodeID == "" || r.UserID == "" {
+		return errors.New("node_id and user_id required")
+	}
+	if err := validateGlobalRuleID(db, r.ID, "managed", r.ID); err != nil {
+		return err
+	}
+	if err := validateManagedRulePortConflicts(db, r); err != nil {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	enabled := 0
+	if r.Enabled {
+		enabled = 1
+	}
+	if _, err := tx.Exec(`INSERT INTO managed_rules(rule_id,node_id,user_id,enabled,protocol,listen_port,target_ip,target_port,match_daddr,description) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule_id) DO UPDATE SET node_id=excluded.node_id,user_id=excluded.user_id,enabled=excluded.enabled,protocol=excluded.protocol,listen_port=excluded.listen_port,target_ip=excluded.target_ip,target_port=excluded.target_port,match_daddr=excluded.match_daddr,description=excluded.description`, r.ID, r.NodeID, r.UserID, enabled, r.Protocol, r.ListenPort, r.TargetIP, r.TargetPort, r.MatchDAddr, r.Description); err != nil {
+		return err
+	}
+	if err := syncNodesTransitFirstTx(tx, []string{r.NodeID}, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func validateManagedRulePortConflicts(db *sql.DB, r ManagedRule) error {
@@ -393,6 +546,18 @@ func validateManagedRulePortConflicts(db *sql.DB, r ManagedRule) error {
 }
 
 func syncNodesTransitFirst(db *sql.DB, nodeIDs ...string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := syncNodesTransitFirstTx(tx, nodeIDs, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func syncNodesTransitFirstTx(tx *sql.Tx, nodeIDs []string, oldLinks []LinkSpec) error {
 	unique := map[string]bool{}
 	for _, id := range nodeIDs {
 		if id != "" {
@@ -403,7 +568,7 @@ func syncNodesTransitFirst(db *sql.DB, nodeIDs ...string) error {
 	nodes := make([]queuedNode, 0, len(unique))
 	for id := range unique {
 		var role string
-		if err := db.QueryRow(`SELECT role FROM node_config WHERE node_id=?`, id).Scan(&role); err != nil {
+		if err := tx.QueryRow(`SELECT role FROM node_config WHERE node_id=?`, id).Scan(&role); err != nil {
 			return err
 		}
 		nodes = append(nodes, queuedNode{id: id, role: role})
@@ -414,12 +579,113 @@ func syncNodesTransitFirst(db *sql.DB, nodeIDs ...string) error {
 		}
 		return nodes[i].id < nodes[j].id
 	})
+	// Include the transit side for links currently rendered by an explicitly
+	// requested ingress, and for a removed/changed old link. This makes a
+	// full ingress replacement wait only on its own forwarding paths.
+	for _, old := range oldLinks {
+		if old.TransitNodeID != "" {
+			unique[old.TransitNodeID] = true
+		}
+	}
 	for _, n := range nodes {
-		if err := syncNode(db, n.id); err != nil {
+		if n.role != "ingress" {
+			continue
+		}
+		rows, err := tx.Query(`SELECT DISTINCT transit_node_id FROM links WHERE ingress_node_id=?`, n.id)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var transitID string
+			if err := rows.Scan(&transitID); err != nil {
+				rows.Close()
+				return err
+			}
+			unique[transitID] = true
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+	}
+	// Rebuild the list after adding required transit nodes.
+	nodes = nodes[:0]
+	for id := range unique {
+		var role string
+		if err := tx.QueryRow(`SELECT role FROM node_config WHERE node_id=?`, id).Scan(&role); err != nil {
+			return err
+		}
+		nodes = append(nodes, queuedNode{id: id, role: role})
+	}
+	sort.Slice(nodes, func(i, j int) bool {
+		if nodes[i].role != nodes[j].role {
+			return nodes[i].role == "transit"
+		}
+		return nodes[i].id < nodes[j].id
+	})
+	transit := map[string]string{}
+	for _, n := range nodes {
+		if n.role != "transit" {
+			continue
+		}
+		rs, err := buildNodeRulesetTx(tx, n.id)
+		if err != nil {
 			return fmt.Errorf("sync %s: %w", n.id, err)
+		}
+		id, err := queueCommandTx(tx, n.id, "apply_ruleset", rs, nil)
+		if err != nil {
+			return err
+		}
+		transit[n.id] = id
+	}
+	for _, n := range nodes {
+		if n.role == "transit" {
+			continue
+		}
+		rs, err := buildNodeRulesetTx(tx, n.id)
+		if err != nil {
+			return fmt.Errorf("sync %s: %w", n.id, err)
+		}
+		deps, err := ingressTransitDependencies(tx, n.id, oldLinks, transit)
+		if err != nil {
+			return err
+		}
+		if _, err := queueCommandTx(tx, n.id, "apply_ruleset", rs, deps); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func ingressTransitDependencies(tx *sql.Tx, ingressID string, oldLinks []LinkSpec, commands map[string]string) ([]string, error) {
+	transits := map[string]bool{}
+	rows, err := tx.Query(`SELECT DISTINCT transit_node_id FROM links WHERE ingress_node_id=?`, ingressID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		transits[id] = true
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, old := range oldLinks {
+		if old.IngressNodeID == ingressID && old.TransitNodeID != "" {
+			transits[old.TransitNodeID] = true
+		}
+	}
+	var deps []string
+	for transitID := range transits {
+		if id := commands[transitID]; id != "" {
+			deps = append(deps, id)
+		}
+	}
+	sort.Strings(deps)
+	return deps, nil
 }
 
 func upsertLink(db *sql.DB, l LinkSpec) error {
@@ -431,14 +697,22 @@ func upsertLink(db *sql.DB, l LinkSpec) error {
 	if err := validateLink(db, l); err != nil {
 		return err
 	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	enabled := 0
 	if l.Enabled {
 		enabled = 1
 	}
-	if _, err := db.Exec(`INSERT INTO links(`+linkColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id,enabled=excluded.enabled,protocol=excluded.protocol,client_port=excluded.client_port,ingress_node_id=excluded.ingress_node_id,ingress_public_ip=excluded.ingress_public_ip,transit_node_id=excluded.transit_node_id,transit_easy_ip=excluded.transit_easy_ip,transit_port=excluded.transit_port,landing_ip=excluded.landing_ip,landing_port=excluded.landing_port,description=excluded.description`, l.ID, l.UserID, enabled, l.Protocol, l.ClientPort, l.IngressNodeID, l.IngressPublicIP, l.TransitNodeID, l.TransitEasyIP, l.TransitPort, l.LandingIP, l.LandingPort, l.Description); err != nil {
+	if _, err := tx.Exec(`INSERT INTO links(`+linkColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id,enabled=excluded.enabled,protocol=excluded.protocol,client_port=excluded.client_port,ingress_node_id=excluded.ingress_node_id,ingress_public_ip=excluded.ingress_public_ip,transit_node_id=excluded.transit_node_id,transit_easy_ip=excluded.transit_easy_ip,transit_port=excluded.transit_port,landing_ip=excluded.landing_ip,landing_port=excluded.landing_port,description=excluded.description`, l.ID, l.UserID, enabled, l.Protocol, l.ClientPort, l.IngressNodeID, l.IngressPublicIP, l.TransitNodeID, l.TransitEasyIP, l.TransitPort, l.LandingIP, l.LandingPort, l.Description); err != nil {
 		return err
 	}
-	return syncNodesTransitFirst(db, old.IngressNodeID, old.TransitNodeID, l.IngressNodeID, l.TransitNodeID)
+	if err := syncNodesTransitFirstTx(tx, []string{old.IngressNodeID, old.TransitNodeID, l.IngressNodeID, l.TransitNodeID}, []LinkSpec{old}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func deleteLink(db *sql.DB, id string) error {
@@ -446,54 +720,66 @@ func deleteLink(db *sql.DB, id string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := db.Exec(`DELETE FROM links WHERE id=?`, id); err != nil {
-		return err
-	}
-	return syncNodesTransitFirst(db, old.IngressNodeID, old.TransitNodeID)
-}
-
-func syncNode(db *sql.DB, nodeID string) error {
-	var nc NodeConfig
-	if err := db.QueryRow(`SELECT node_id,role,nat_et_ip FROM node_config WHERE node_id=?`, nodeID).Scan(&nc.NodeID, &nc.Role, &nc.NATETIP); err != nil {
-		return err
-	}
-	rows, err := db.Query(`SELECT rule_id,user_id,enabled,protocol,listen_port,target_ip,target_port,match_daddr,description FROM managed_rules WHERE node_id=? ORDER BY rule_id`, nodeID)
+	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM links WHERE id=?`, id); err != nil {
+		return err
+	}
+	if err := syncNodesTransitFirstTx(tx, []string{old.IngressNodeID, old.TransitNodeID}, []LinkSpec{old}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func syncNode(db *sql.DB, nodeID string) error {
+	return syncNodesTransitFirst(db, nodeID)
+}
+
+func buildNodeRuleset(db *sql.DB, nodeID string) (Ruleset, error) {
+	var nc NodeConfig
+	if err := db.QueryRow(`SELECT node_id,role,nat_et_ip FROM node_config WHERE node_id=?`, nodeID).Scan(&nc.NodeID, &nc.Role, &nc.NATETIP); err != nil {
+		return Ruleset{}, err
+	}
 	rs := Ruleset{Role: nc.Role, NATETIP: nc.NATETIP}
 	now := time.Now().Unix()
+	rows, err := db.Query(`SELECT rule_id,user_id,enabled,protocol,listen_port,target_ip,target_port,match_daddr,description FROM managed_rules WHERE node_id=? ORDER BY rule_id`, nodeID)
+	if err != nil {
+		return Ruleset{}, err
+	}
+	defer rows.Close()
 	for rows.Next() {
 		var r ManagedRule
 		var enabled int
 		if err := rows.Scan(&r.ID, &r.UserID, &enabled, &r.Protocol, &r.ListenPort, &r.TargetIP, &r.TargetPort, &r.MatchDAddr, &r.Description); err != nil {
-			return err
+			return Ruleset{}, err
 		}
 		active, err := activeUser(db, r.UserID, now)
 		if err != nil {
-			return err
+			return Ruleset{}, err
 		}
 		if enabled != 0 && active {
 			rs.Rules = append(rs.Rules, r.RuleSpec)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return Ruleset{}, err
 	}
 	linkRows, err := db.Query(`SELECT `+linkColumns+` FROM links WHERE ingress_node_id=? OR transit_node_id=? ORDER BY id`, nodeID, nodeID)
 	if err != nil {
-		return err
+		return Ruleset{}, err
 	}
 	defer linkRows.Close()
 	for linkRows.Next() {
 		l, err := scanLink(linkRows)
 		if err != nil {
-			return err
+			return Ruleset{}, err
 		}
 		active, err := activeUser(db, l.UserID, now)
 		if err != nil {
-			return err
+			return Ruleset{}, err
 		}
 		if !l.Enabled || !active {
 			continue
@@ -507,13 +793,106 @@ func syncNode(db *sql.DB, nodeID string) error {
 		}
 	}
 	if err := linkRows.Err(); err != nil {
-		return err
+		return Ruleset{}, err
 	}
 	sort.Slice(rs.Rules, func(i, j int) bool { return rs.Rules[i].ID < rs.Rules[j].ID })
 	if _, err := renderNFT(rs); err != nil {
-		return err
+		return Ruleset{}, err
 	}
-	return queueCommand(db, nodeID, "apply_ruleset", rs)
+	return rs, nil
+}
+
+func activeUserTx(tx *sql.Tx, userID string, now int64) (bool, error) {
+	var enabled int
+	var expires, quota int64
+	var mode string
+	if err := tx.QueryRow(`SELECT enabled,expires_at,quota_bytes,billing_mode FROM users WHERE user_id=?`, userID).Scan(&enabled, &expires, &quota, &mode); err != nil {
+		return false, err
+	}
+	if enabled == 0 || (expires > 0 && now >= expires) {
+		return false, nil
+	}
+	if quota == 0 {
+		return true, nil
+	}
+	var used int64
+	var query string
+	switch mode {
+	case "up":
+		query = `SELECT COALESCE(SUM(e.up_bytes),0) FROM usage_events e LEFT JOIN managed_rules r ON r.rule_id=e.rule_id AND r.node_id=e.node_id LEFT JOIN links l ON l.id=e.rule_id AND l.ingress_node_id=e.node_id WHERE r.user_id=? OR l.user_id=?`
+	case "down":
+		query = `SELECT COALESCE(SUM(e.down_bytes),0) FROM usage_events e LEFT JOIN managed_rules r ON r.rule_id=e.rule_id AND r.node_id=e.node_id LEFT JOIN links l ON l.id=e.rule_id AND l.ingress_node_id=e.node_id WHERE r.user_id=? OR l.user_id=?`
+	default:
+		query = `SELECT COALESCE(SUM(e.up_bytes+e.down_bytes),0) FROM usage_events e LEFT JOIN managed_rules r ON r.rule_id=e.rule_id AND r.node_id=e.node_id LEFT JOIN links l ON l.id=e.rule_id AND l.ingress_node_id=e.node_id WHERE r.user_id=? OR l.user_id=?`
+	}
+	if err := tx.QueryRow(query, userID, userID).Scan(&used); err != nil {
+		return false, err
+	}
+	return used < quota, nil
+}
+
+func buildNodeRulesetTx(tx *sql.Tx, nodeID string) (Ruleset, error) {
+	var nc NodeConfig
+	if err := tx.QueryRow(`SELECT node_id,role,nat_et_ip FROM node_config WHERE node_id=?`, nodeID).Scan(&nc.NodeID, &nc.Role, &nc.NATETIP); err != nil {
+		return Ruleset{}, err
+	}
+	rs := Ruleset{Role: nc.Role, NATETIP: nc.NATETIP}
+	now := time.Now().Unix()
+	rows, err := tx.Query(`SELECT rule_id,user_id,enabled,protocol,listen_port,target_ip,target_port,match_daddr,description FROM managed_rules WHERE node_id=? ORDER BY rule_id`, nodeID)
+	if err != nil {
+		return Ruleset{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r ManagedRule
+		var enabled int
+		if err := rows.Scan(&r.ID, &r.UserID, &enabled, &r.Protocol, &r.ListenPort, &r.TargetIP, &r.TargetPort, &r.MatchDAddr, &r.Description); err != nil {
+			return Ruleset{}, err
+		}
+		active, err := activeUserTx(tx, r.UserID, now)
+		if err != nil {
+			return Ruleset{}, err
+		}
+		if enabled != 0 && active {
+			rs.Rules = append(rs.Rules, r.RuleSpec)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return Ruleset{}, err
+	}
+	linkRows, err := tx.Query(`SELECT `+linkColumns+` FROM links WHERE ingress_node_id=? OR transit_node_id=? ORDER BY id`, nodeID, nodeID)
+	if err != nil {
+		return Ruleset{}, err
+	}
+	defer linkRows.Close()
+	for linkRows.Next() {
+		l, err := scanLink(linkRows)
+		if err != nil {
+			return Ruleset{}, err
+		}
+		active, err := activeUserTx(tx, l.UserID, now)
+		if err != nil {
+			return Ruleset{}, err
+		}
+		if !l.Enabled || !active {
+			continue
+		}
+		ingress, transit := linkRules(l)
+		if l.IngressNodeID == nodeID {
+			rs.Rules = append(rs.Rules, ingress)
+		}
+		if l.TransitNodeID == nodeID {
+			rs.Rules = append(rs.Rules, transit)
+		}
+	}
+	if err := linkRows.Err(); err != nil {
+		return Ruleset{}, err
+	}
+	sort.Slice(rs.Rules, func(i, j int) bool { return rs.Rules[i].ID < rs.Rules[j].ID })
+	if _, err := renderNFT(rs); err != nil {
+		return Ruleset{}, err
+	}
+	return rs, nil
 }
 func runAdmin(database, requestFile string) {
 	if requestFile == "" {
@@ -543,21 +922,7 @@ func runAdmin(database, requestFile string) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
-		if err := validateUser(u); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
-		if u.BillingMode == "" {
-			u.BillingMode = "both"
-		}
-		en := 0
-		if u.Enabled {
-			en = 1
-		}
-		_, err = db.Exec(`INSERT INTO users(user_id,enabled,expires_at,quota_bytes,billing_mode) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled,expires_at=excluded.expires_at,quota_bytes=excluded.quota_bytes,billing_mode=excluded.billing_mode`, u.ID, en, u.ExpiresAt, u.QuotaBytes, u.BillingMode)
-		if err == nil {
-			err = syncUserNodes(db, u.ID)
-		}
+		err = upsertUser(db, u)
 	case "upsert_node":
 		var n NodeConfig
 		if err := json.Unmarshal(req.Body, &n); err != nil {
@@ -577,22 +942,7 @@ func runAdmin(database, requestFile string) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
-		if err = validateRuleset(Ruleset{Role: "ingress", Rules: []RuleSpec{r.RuleSpec}}); err == nil && (r.NodeID == "" || r.UserID == "") {
-			err = errors.New("node_id and user_id required")
-		}
-		if err == nil {
-			err = validateManagedRulePortConflicts(db, r)
-		}
-		if err == nil {
-			en := 0
-			if r.Enabled {
-				en = 1
-			}
-			_, err = db.Exec(`INSERT INTO managed_rules(rule_id,node_id,user_id,enabled,protocol,listen_port,target_ip,target_port,match_daddr,description) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule_id) DO UPDATE SET node_id=excluded.node_id,user_id=excluded.user_id,enabled=excluded.enabled,protocol=excluded.protocol,listen_port=excluded.listen_port,target_ip=excluded.target_ip,target_port=excluded.target_port,match_daddr=excluded.match_daddr,description=excluded.description`, r.ID, r.NodeID, r.UserID, en, r.Protocol, r.ListenPort, r.TargetIP, r.TargetPort, r.MatchDAddr, r.Description)
-			if err == nil {
-				err = syncNodesTransitFirst(db, r.NodeID)
-			}
-		}
+		err = upsertManagedRule(db, r)
 	case "upsert_link":
 		var l LinkSpec
 		if err := json.Unmarshal(req.Body, &l); err != nil {

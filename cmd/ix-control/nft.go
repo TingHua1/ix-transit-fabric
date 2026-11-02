@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +36,29 @@ type Ruleset struct {
 	Rules   []RuleSpec `json:"rules"`
 }
 
+// PersistedRuleset wraps the historical bare Ruleset with replay protection
+// metadata. loadRulesetState deliberately accepts the historical format.
+type PersistedRuleset struct {
+	Ruleset
+	Version int64  `json:"version"`
+	Hash    string `json:"hash"`
+}
+
+func rulesetHash(rs Ruleset) (string, error) {
+	if err := validateRuleset(rs); err != nil {
+		return "", err
+	}
+	copy := rs
+	copy.Rules = append([]RuleSpec(nil), rs.Rules...)
+	sort.Slice(copy.Rules, func(i, j int) bool { return copy.Rules[i].ID < copy.Rules[j].ID })
+	b, err := json.Marshal(copy)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("%x", sum[:]), nil
+}
+
 type CollectorState struct {
 	Initialized bool              `json:"initialized"`
 	Sequence    map[string]int64  `json:"sequence"`
@@ -64,10 +88,15 @@ func validateRuleset(rs Ruleset) error {
 		}
 	}
 	seen := map[string]bool{}
+	ids := map[string]bool{}
 	for _, r := range rs.Rules {
 		if !ruleIDRE.MatchString(r.ID) {
 			return fmt.Errorf("invalid rule id %q", r.ID)
 		}
+		if ids[r.ID] {
+			return fmt.Errorf("duplicate rule id %s", r.ID)
+		}
+		ids[r.ID] = true
 		if r.ListenPort == 0 || r.TargetPort == 0 {
 			return fmt.Errorf("rule %s has invalid port", r.ID)
 		}
@@ -325,22 +354,8 @@ func collectCounters(statePath, queuePath, nodeID string) error {
 
 func runNFTTool(commandFile, collectState, queue, nodeID string) {
 	if commandFile != "" {
-		b, err := os.ReadFile(commandFile)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
-		var c Command
-		if err := json.Unmarshal(b, &c); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
-		ok, detail := applyRulesetCommand(c)
-		fmt.Println(detail)
-		if !ok {
-			os.Exit(1)
-		}
-		return
+		fmt.Fprintln(os.Stderr, "--command-file apply is disabled; use nft-hook with --ruleset-state")
+		os.Exit(2)
 	}
 	if collectState != "" {
 		if err := collectCounters(collectState, queue, nodeID); err != nil {
@@ -368,19 +383,106 @@ func saveRuleset(path string, rs json.RawMessage) error {
 }
 
 func restoreRuleset(path string) error {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	var rs Ruleset
-	if err := json.Unmarshal(b, &rs); err != nil {
-		return fmt.Errorf("invalid persisted ruleset: %w", err)
-	}
-	script, err := renderNFT(rs)
+	state, err := loadRulesetState(path)
+	if err != nil { return err }
+	script, err := renderNFT(state.Ruleset)
 	if err != nil {
 		return err
 	}
 	return nftCheckAndApply(script)
+}
+
+func loadRulesetState(path string) (PersistedRuleset, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return PersistedRuleset{}, err
+	}
+	var wrapped PersistedRuleset
+	if err := json.Unmarshal(b, &wrapped); err != nil {
+		return wrapped, fmt.Errorf("invalid persisted ruleset: %w", err)
+	}
+	// Embedded Ruleset preserves compatibility with the historical bare format.
+	if err := validateRuleset(wrapped.Ruleset); err != nil {
+		return wrapped, err
+	}
+	if wrapped.Hash == "" {
+		wrapped.Hash, err = rulesetHash(wrapped.Ruleset)
+		if err != nil {
+			return wrapped, err
+		}
+	}
+	return wrapped, nil
+}
+
+func savePersistedRuleset(path string, state PersistedRuleset) error {
+	b, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	return saveRuleset(path, b)
+}
+
+// rulesetApplyDecision is side-effect free so replay protection is testable
+// without invoking nft. A stale command is acknowledged successfully; a hash
+// mismatch at the same version is a protocol violation and must not apply.
+func rulesetApplyDecision(current PersistedRuleset, c Command) (Ruleset, bool, string) {
+	var rs Ruleset
+	if c.Type != "apply_ruleset" {
+		return rs, false, "unsupported command type"
+	}
+	if err := json.Unmarshal(c.Body, &rs); err != nil {
+		return rs, false, "invalid ruleset JSON: " + err.Error()
+	}
+	hash, err := rulesetHash(rs)
+	if err != nil {
+		return rs, false, err.Error()
+	}
+	if c.RulesetHash != "" && c.RulesetHash != hash {
+		return rs, false, "ruleset hash does not match body"
+	}
+	if c.RulesetVersion < current.Version {
+		return rs, false, "stale ruleset already applied"
+	}
+	if c.RulesetVersion == current.Version {
+		if current.Hash == hash {
+			return rs, false, "ruleset already applied"
+		}
+		return rs, false, "same ruleset version has different hash"
+	}
+	return rs, true, ""
+}
+
+func applyPersistedRulesetCommand(stateFile string, c Command) (bool, string) {
+	current := PersistedRuleset{}
+	if stateFile == "" {
+		return false, "ruleset state path is required"
+	}
+	if _, err := os.Stat(stateFile); err == nil {
+		var loadErr error
+		current, loadErr = loadRulesetState(stateFile)
+		if loadErr != nil {
+			return false, loadErr.Error()
+		}
+	}
+	rs, apply, detail := rulesetApplyDecision(current, c)
+	if !apply {
+		if detail == "stale ruleset already applied" || detail == "ruleset already applied" {
+			return true, detail
+		}
+		return false, detail
+	}
+	ok, detail := applyRulesetCommand(c)
+	if !ok {
+		return false, detail
+	}
+	hash, err := rulesetHash(rs)
+	if err != nil {
+		return false, err.Error()
+	}
+	if err := savePersistedRuleset(stateFile, PersistedRuleset{Ruleset: rs, Version: c.RulesetVersion, Hash: hash}); err != nil {
+		return false, "rules applied but state persistence failed: " + err.Error()
+	}
+	return true, detail
 }
 
 func runNFTHook(stateFile string) {
@@ -389,13 +491,7 @@ func runNFTHook(stateFile string) {
 		fmt.Fprintln(os.Stderr, "invalid command:", err)
 		os.Exit(2)
 	}
-	ok, detail := applyRulesetCommand(c)
-	if ok {
-		if err := saveRuleset(stateFile, c.Body); err != nil {
-			ok = false
-			detail = "rules applied but state persistence failed: " + err.Error()
-		}
-	}
+	ok, detail := applyPersistedRulesetCommand(stateFile, c)
 	fmt.Println(detail)
 	if !ok {
 		os.Exit(1)

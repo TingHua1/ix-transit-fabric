@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -263,6 +264,121 @@ func TestLinkUpdateDeleteRemoveOldRulesAndMeterOnlyIngress(t *testing.T) {
 	}
 	if got := latestRuleset(t, db, "tran"); len(got.Rules) != 0 {
 		t.Fatalf("deleted transit rule retained: %#v", got.Rules)
+	}
+}
+
+func commandDeps(t *testing.T, db *sql.DB, nodeID string) []string {
+	t.Helper()
+	var raw string
+	if err := db.QueryRow(`SELECT depends_on FROM commands WHERE node_id=? ORDER BY rowid DESC LIMIT 1`, nodeID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var deps []string
+	if err := json.Unmarshal([]byte(raw), &deps); err != nil {
+		t.Fatal(err)
+	}
+	return deps
+}
+
+func TestGlobalRuleIDConflicts(t *testing.T) {
+	db := testManagementDB(t, "ixcontrolglobalids")
+	defer db.Close()
+	if err := upsertLink(db, testLink("link", 33001, 43001)); err != nil {
+		t.Fatal(err)
+	}
+	managed := ManagedRule{RuleSpec: RuleSpec{ID: "link", Protocol: "tcp", ListenPort: 33002, TargetIP: "192.0.2.3", TargetPort: 443}, NodeID: "ing", UserID: "u1", Enabled: true}
+	if err := upsertManagedRule(db, managed); err == nil {
+		t.Fatal("managed id matching link id accepted")
+	}
+	managed.ID = "t-link"
+	if err := upsertManagedRule(db, managed); err == nil {
+		t.Fatal("managed id matching transit link id accepted")
+	}
+	if err := upsertLink(db, testLink("t-link", 33003, 43003)); err == nil {
+		t.Fatal("link id matching another transit link id accepted")
+	}
+}
+
+func TestIngressDependenciesOnlyIncludeItsTransitAndOldLink(t *testing.T) {
+	db := testManagementDB(t, "ixcontroldepsprecise")
+	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO node_config VALUES('tran2','transit','10.9.0.3')`); err != nil {
+		t.Fatal(err)
+	}
+	first := testLink("first", 33101, 43101)
+	if err := upsertLink(db, first); err != nil {
+		t.Fatal(err)
+	}
+	other := testLink("other", 33102, 43102)
+	other.TransitNodeID, other.TransitEasyIP = "tran2", "10.9.0.3"
+	if err := upsertLink(db, other); err != nil {
+		t.Fatal(err)
+	}
+	var tranID, tran2ID string
+	if err := db.QueryRow(`SELECT id FROM commands WHERE node_id='tran' ORDER BY rowid DESC LIMIT 1`).Scan(&tranID); err != nil { t.Fatal(err) }
+	if err := db.QueryRow(`SELECT id FROM commands WHERE node_id='tran2' ORDER BY rowid DESC LIMIT 1`).Scan(&tran2ID); err != nil { t.Fatal(err) }
+	deps := commandDeps(t, db, "ing")
+	if len(deps) != 2 || !containsText(strings.Join(deps, ","), tranID) || !containsText(strings.Join(deps, ","), tran2ID) {
+		t.Fatalf("aggregated ingress must depend on both own transits: %v", deps)
+	}
+	if err := deleteLink(db, "other"); err != nil {
+		t.Fatal(err)
+	}
+	deps = commandDeps(t, db, "ing")
+	if len(deps) != 2 {
+		t.Fatalf("delete must retain old transit gate: %v", deps)
+	}
+}
+
+func TestSyncNodeIngressWaitsForTransitCommand(t *testing.T) {
+	db := testManagementDB(t, "ixcontrolsyncnodegate")
+	defer db.Close()
+	if err := upsertLink(db, testLink("sync-gate", 33151, 43151)); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncNode(db, "ing"); err != nil {
+		t.Fatal(err)
+	}
+	var transitID string
+	if err := db.QueryRow(`SELECT id FROM commands WHERE node_id='tran' ORDER BY rowid DESC LIMIT 1`).Scan(&transitID); err != nil {
+		t.Fatal(err)
+	}
+	deps := commandDeps(t, db, "ing")
+	if len(deps) != 1 || deps[0] != transitID {
+		t.Fatalf("sync ingress dependencies=%v transit=%s", deps, transitID)
+	}
+	s := &Server{db: db}
+	commands, err := s.pendingCommands("ing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 0 {
+		t.Fatalf("ingress leaked before transit acknowledgement: %#v", commands)
+	}
+	if ok, err := s.ackCommand("tran", transitID, "done", "applied"); err != nil || !ok {
+		t.Fatalf("transit acknowledgement ok=%v err=%v", ok, err)
+	}
+	commands, err = s.pendingCommands("ing")
+	if err != nil || len(commands) != 1 {
+		t.Fatalf("ingress after transit done commands=%#v err=%v", commands, err)
+	}
+}
+
+func TestLinkWriteRollsBackWhenPlanningFails(t *testing.T) {
+	db := testManagementDB(t, "ixcontrolrollback")
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER reject_planned_command BEFORE INSERT ON commands BEGIN SELECT RAISE(ABORT, 'planner blocked'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := upsertLink(db, testLink("rollback", 33201, 43201)); err == nil {
+		t.Fatal("expected planner failure")
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM links WHERE id='rollback'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("link write survived failed planning transaction")
 	}
 }
 func containsText(s, sub string) bool {

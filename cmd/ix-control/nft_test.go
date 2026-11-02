@@ -24,11 +24,27 @@ func TestRenderRejectsUnsafeOrDuplicateSelectors(t *testing.T) {
 	for _, rs := range []Ruleset{
 		{Role: "transit", NATETIP: "10.0.0.1", Rules: []RuleSpec{{ID: "bad id", Protocol: "tcp", ListenPort: 1, TargetIP: "1.1.1.1", TargetPort: 1}}},
 		{Role: "ingress", Rules: []RuleSpec{{ID: "one", Protocol: "both", ListenPort: 443, TargetIP: "1.1.1.1", TargetPort: 443}, {ID: "two", Protocol: "tcp", ListenPort: 443, TargetIP: "2.2.2.2", TargetPort: 443}}},
+		{Role: "ingress", Rules: []RuleSpec{{ID: "one", Protocol: "tcp", ListenPort: 443, TargetIP: "1.1.1.1", TargetPort: 443}, {ID: "one", Protocol: "udp", ListenPort: 444, TargetIP: "2.2.2.2", TargetPort: 443}}},
 	} {
 		if _, err := renderNFT(rs); err == nil {
 			t.Fatalf("expected invalid ruleset rejection: %#v", rs)
 		}
 	}
+}
+
+func TestRulesetHashAndAgentVersionDecision(t *testing.T) {
+	rs := Ruleset{Role: "ingress", Rules: []RuleSpec{{ID: "one", Protocol: "tcp", ListenPort: 443, TargetIP: "1.1.1.1", TargetPort: 443}}}
+	h, err := rulesetHash(rs); if err != nil { t.Fatal(err) }
+	if again, _ := rulesetHash(rs); h != again { t.Fatal("ruleset hash is not deterministic") }
+	cmd := Command{Type: "apply_ruleset", Body: mustJSON(rs), RulesetVersion: 2, RulesetHash: h}
+	state := PersistedRuleset{Ruleset: rs, Version: 2, Hash: h}
+	if _, apply, _ := rulesetApplyDecision(state, cmd); apply { t.Fatal("same version/hash must not apply") }
+	cmd.RulesetVersion = 1
+	if _, apply, _ := rulesetApplyDecision(state, cmd); apply { t.Fatal("older version must not apply") }
+	cmd.RulesetVersion, cmd.RulesetHash = 2, strings.Repeat("0", 64)
+	if _, apply, _ := rulesetApplyDecision(state, cmd); apply { t.Fatal("same version different hash must reject") }
+	cmd.RulesetVersion, cmd.RulesetHash = 3, h
+	if _, apply, detail := rulesetApplyDecision(state, cmd); !apply || detail != "" { t.Fatalf("new version decision=%v %q", apply, detail) }
 }
 func TestLegacyConflict(t *testing.T) {
 	rs := Ruleset{Role: "ingress", Rules: []RuleSpec{{ID: "one", Protocol: "tcp", ListenPort: 30000, TargetIP: "1.1.1.1", TargetPort: 443}}}
