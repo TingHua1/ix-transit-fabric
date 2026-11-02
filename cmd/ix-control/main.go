@@ -389,7 +389,7 @@ func markUsageAcked(path string, accepted Usage) {
 }
 
 func main() {
-	mode := flag.String("mode", "server", "server or agent")
+	mode := flag.String("mode", "server", "server, agent, nft, nft-hook, or admin")
 	addr := flag.String("listen", "127.0.0.1:8787", "server listen address")
 	db := flag.String("db", "./ix-control.db", "sqlite database")
 	url := flag.String("server", "", "control websocket URL")
@@ -398,6 +398,9 @@ func main() {
 	tokenFile := flag.String("token-file", "", "0600 file containing node token")
 	usage := flag.String("usage-file", "./usage.ndjson", "agent usage input")
 	applyHook := flag.String("apply-hook", "", "absolute reviewed local command adapter")
+	commandFile := flag.String("command-file", "", "structured apply_ruleset command JSON for nft mode")
+	collectorState := flag.String("collector-state", "", "collector state file for nft mode")
+	adminFile := flag.String("admin-file", "", "management request JSON for admin mode")
 	flag.Parse()
 	if *mode == "server" {
 		runServer(*addr, *db)
@@ -407,5 +410,17 @@ func main() {
 		runAgent(*url, *node, *token, *tokenFile, *usage, *applyHook)
 		return
 	}
-	log.Fatal("--mode must be server or agent")
+	if *mode == "nft" {
+		runNFTTool(*commandFile, *collectorState, *usage, *node)
+		return
+	}
+	if *mode == "nft-hook" {
+		runNFTHook()
+		return
+	}
+	if *mode == "admin" {
+		runAdmin(*db, *adminFile)
+		return
+	}
+	log.Fatal("--mode must be server, agent, nft, nft-hook, or admin")
 }
