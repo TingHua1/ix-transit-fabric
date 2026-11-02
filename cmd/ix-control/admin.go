@@ -243,6 +243,45 @@ func runAdmin(database, requestFile string) {
 	fmt.Println("ok")
 }
 
+func reconcileAll(db *sql.DB) error {
+	rows, err := db.Query(`SELECT node_id FROM node_config ORDER BY node_id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var nodes []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		nodes = append(nodes, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range nodes {
+		if err := syncNode(db, id); err != nil {
+			return fmt.Errorf("sync %s: %w", id, err)
+		}
+	}
+	return nil
+}
+
+func runReconcile(database string) {
+	db := openDB(database)
+	defer db.Close()
+	if err := initManagementSchema(db); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := reconcileAll(db); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Println("ok")
+}
+
 // Guard duplicate rule IDs deterministically in tests and future callers.
 func sortedRuleIDs(rs []RuleSpec) []string {
 	o := make([]string, len(rs))

@@ -389,7 +389,7 @@ func markUsageAcked(path string, accepted Usage) {
 }
 
 func main() {
-	mode := flag.String("mode", "server", "server, agent, nft, nft-hook, or admin")
+	mode := flag.String("mode", "server", "server, agent, nft, nft-hook, restore, reconcile, or admin")
 	addr := flag.String("listen", "127.0.0.1:8787", "server listen address")
 	db := flag.String("db", "./ix-control.db", "sqlite database")
 	url := flag.String("server", "", "control websocket URL")
@@ -400,6 +400,7 @@ func main() {
 	applyHook := flag.String("apply-hook", "", "absolute reviewed local command adapter")
 	commandFile := flag.String("command-file", "", "structured apply_ruleset command JSON for nft mode")
 	collectorState := flag.String("collector-state", "", "collector state file for nft mode")
+	rulesetState := flag.String("ruleset-state", "/var/lib/ix-control/ruleset.json", "persisted authorized ruleset path")
 	adminFile := flag.String("admin-file", "", "management request JSON for admin mode")
 	flag.Parse()
 	if *mode == "server" {
@@ -415,7 +416,17 @@ func main() {
 		return
 	}
 	if *mode == "nft-hook" {
-		runNFTHook()
+		runNFTHook(*rulesetState)
+		return
+	}
+	if *mode == "restore" {
+		if err := restoreRuleset(*rulesetState); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if *mode == "reconcile" {
+		runReconcile(*db)
 		return
 	}
 	if *mode == "admin" {

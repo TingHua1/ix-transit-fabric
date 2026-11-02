@@ -349,13 +349,49 @@ func runNFTTool(commandFile, collectState, queue, nodeID string) {
 	os.Exit(2)
 }
 
-func runNFTHook() {
+func saveRuleset(path string, rs json.RawMessage) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, rs, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func restoreRuleset(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var rs Ruleset
+	if err := json.Unmarshal(b, &rs); err != nil {
+		return fmt.Errorf("invalid persisted ruleset: %w", err)
+	}
+	script, err := renderNFT(rs)
+	if err != nil {
+		return err
+	}
+	return nftCheckAndApply(script)
+}
+
+func runNFTHook(stateFile string) {
 	var c Command
 	if err := json.NewDecoder(os.Stdin).Decode(&c); err != nil {
 		fmt.Fprintln(os.Stderr, "invalid command:", err)
 		os.Exit(2)
 	}
 	ok, detail := applyRulesetCommand(c)
+	if ok {
+		if err := saveRuleset(stateFile, c.Body); err != nil {
+			ok = false
+			detail = "rules applied but state persistence failed: " + err.Error()
+		}
+	}
 	fmt.Println(detail)
 	if !ok {
 		os.Exit(1)
