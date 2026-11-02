@@ -119,34 +119,62 @@ func TestWebSocketRejectsAgentWithoutRulesetVersionGuard(t *testing.T) {
 
 func TestPendingCommandsRespectDependenciesAndPropagateFailure(t *testing.T) {
 	db, err := sql.Open("sqlite3", "file:ixcontroldepstest?mode=memory&cache=shared")
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer db.Close()
-	if err := initSchema(db); err != nil { t.Fatal(err) }
+	if err := initSchema(db); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.Exec(`INSERT INTO commands(id,node_id,type,body,depends_on,created_at) VALUES
 ('transit','t','apply_ruleset','{}','[]',1),
-('ingress','i','apply_ruleset','{}','["transit"]',2)`); err != nil { t.Fatal(err) }
+('ingress','i','apply_ruleset','{}','["transit"]',2)`); err != nil {
+		t.Fatal(err)
+	}
 	s := &Server{db: db}
-	if got, err := s.pendingCommands("i"); err != nil || len(got) != 0 { t.Fatalf("dependent ingress leaked: %#v %v", got, err) }
-	if ok, err := s.ackCommand("t", "transit", "failed", "nft failed"); err != nil || !ok { t.Fatalf("ack: %v %v", ok, err) }
+	if got, err := s.pendingCommands("i"); err != nil || len(got) != 0 {
+		t.Fatalf("dependent ingress leaked: %#v %v", got, err)
+	}
+	if ok, err := s.ackCommand("t", "transit", "failed", "nft failed"); err != nil || !ok {
+		t.Fatalf("ack: %v %v", ok, err)
+	}
 	var state string
-	if err := db.QueryRow(`SELECT state FROM commands WHERE id='ingress'`).Scan(&state); err != nil { t.Fatal(err) }
-	if state != "cancelled" { t.Fatalf("ingress state=%q", state) }
+	if err := db.QueryRow(`SELECT state FROM commands WHERE id='ingress'`).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "cancelled" {
+		t.Fatalf("ingress state=%q", state)
+	}
 }
 
 func TestSupersededDependencyPropagatesAcrossNodes(t *testing.T) {
 	db, err := sql.Open("sqlite3", "file:ixcontrolsupersedetest?mode=memory&cache=shared")
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer db.Close()
-	if err := initSchema(db); err != nil { t.Fatal(err) }
+	if err := initSchema(db); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.Exec(`INSERT INTO commands(id,node_id,type,body,depends_on,created_at) VALUES
 ('transit','t','apply_ruleset','{}','[]',1),
-('ingress','i','apply_ruleset','{}','["transit"]',2)`); err != nil { t.Fatal(err) }
-	if _, err := db.Exec(`UPDATE commands SET state='superseded' WHERE id='transit'`); err != nil { t.Fatal(err) }
+('ingress','i','apply_ruleset','{}','["transit"]',2)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE commands SET state='superseded' WHERE id='transit'`); err != nil {
+		t.Fatal(err)
+	}
 	s := &Server{db: db}
-	if _, err := s.pendingCommands("i"); err != nil { t.Fatal(err) }
+	if _, err := s.pendingCommands("i"); err != nil {
+		t.Fatal(err)
+	}
 	var state string
-	if err := db.QueryRow(`SELECT state FROM commands WHERE id='ingress'`).Scan(&state); err != nil { t.Fatal(err) }
-	if state != "superseded" { t.Fatalf("ingress state=%q", state) }
+	if err := db.QueryRow(`SELECT state FROM commands WHERE id='ingress'`).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "superseded" {
+		t.Fatalf("ingress state=%q", state)
+	}
 }
 
 func TestAckRejectsTerminalAndInvalidStates(t *testing.T) {

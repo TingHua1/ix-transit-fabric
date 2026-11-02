@@ -32,6 +32,7 @@ type NodeConfig struct {
 	Role    string `json:"role"`
 	NATETIP string `json:"nat_et_ip,omitempty"`
 }
+
 // LinkSpec describes one client-facing forwarding path.  Its ingress rule is
 // the sole metered rule; the transit rule exists only to complete the path.
 type LinkSpec struct {

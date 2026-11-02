@@ -315,8 +315,12 @@ func TestIngressDependenciesOnlyIncludeItsTransitAndOldLink(t *testing.T) {
 		t.Fatal(err)
 	}
 	var tranID, tran2ID string
-	if err := db.QueryRow(`SELECT id FROM commands WHERE node_id='tran' ORDER BY rowid DESC LIMIT 1`).Scan(&tranID); err != nil { t.Fatal(err) }
-	if err := db.QueryRow(`SELECT id FROM commands WHERE node_id='tran2' ORDER BY rowid DESC LIMIT 1`).Scan(&tran2ID); err != nil { t.Fatal(err) }
+	if err := db.QueryRow(`SELECT id FROM commands WHERE node_id='tran' ORDER BY rowid DESC LIMIT 1`).Scan(&tranID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT id FROM commands WHERE node_id='tran2' ORDER BY rowid DESC LIMIT 1`).Scan(&tran2ID); err != nil {
+		t.Fatal(err)
+	}
 	deps := commandDeps(t, db, "ing")
 	if len(deps) != 2 || !containsText(strings.Join(deps, ","), tranID) || !containsText(strings.Join(deps, ","), tran2ID) {
 		t.Fatalf("aggregated ingress must depend on both own transits: %v", deps)

@@ -384,7 +384,9 @@ func saveRuleset(path string, rs json.RawMessage) error {
 
 func restoreRuleset(path string) error {
 	state, err := loadRulesetState(path)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	script, err := renderNFT(state.Ruleset)
 	if err != nil {
 		return err
