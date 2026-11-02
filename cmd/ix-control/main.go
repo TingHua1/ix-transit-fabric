@@ -546,7 +546,7 @@ func runServer(addr, database string) {
 	must(http.ListenAndServe(addr, nil))
 }
 
-func runAgent(serverURL, nodeID, token, tokenFile, usageFile, applyHook, rulesetState string) {
+func runAgent(serverURL, nodeID, token, tokenFile, usageFile, applyHook, rulesetState, nodeNetworkConfig string) {
 	if tokenFile != "" {
 		b, err := os.ReadFile(tokenFile)
 		if err != nil {
@@ -557,7 +557,7 @@ func runAgent(serverURL, nodeID, token, tokenFile, usageFile, applyHook, ruleset
 	if nodeID == "" || token == "" {
 		log.Fatal("--node-id and --token or --token-file are required")
 	}
-	reporter, err := newAgentStatusReporter(rulesetState)
+	reporter, err := newAgentStatusReporter(rulesetState, nodeNetworkConfig)
 	if err != nil {
 		log.Fatalf("initialize persistent local status generation: %v", err)
 	}
@@ -729,6 +729,15 @@ func markUsageAcked(path string, accepted Usage) {
 }
 
 func main() {
+	// Keep the node-network command independent from the historical global flag
+	// parser so `ix-control node-network validate --config ...` is a real local
+	// subcommand, while --mode node-network remains available below.
+	if len(os.Args) > 1 && os.Args[1] == "node-network" {
+		if err := runNodeNetworkCLI(os.Args[2:], os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	mode := flag.String("mode", "server", "server, agent, nft, nft-hook, restore, reconcile, admin, or systemd-render")
 	addr := flag.String("listen", "127.0.0.1:8787", "server listen address")
 	db := flag.String("db", "./ix-control.db", "sqlite database")
@@ -748,7 +757,18 @@ func main() {
 	systemdStateDir := flag.String("systemd-state-dir", SystemdStateDir, "systemd-render state directory")
 	systemdDBDSN := flag.String("systemd-db-dsn", "file:/var/lib/ix-control/ix-control.db?_busy_timeout=5000&_journal_mode=WAL", "systemd-render SQLite file DSN")
 	systemdTokenFileMode := flag.String("systemd-token-file-mode", "0600", "systemd-render declared token-file mode; must be 0600")
+	nodeNetworkAction := flag.String("node-network-action", "", "node-network action: validate, render-systemd, install-local, apply-local, status, stop, or uninstall")
+	nodeNetworkConfig := flag.String("node-network-config", "", "local node-network JSON configuration file")
+	nodeNetworkArtifact := flag.String("artifact", "", "locally downloaded EasyTier artifact for node-network install-local")
+	nodeNetworkSHA256 := flag.String("sha256", "", "expected lowercase SHA-256 for --artifact")
+	nodeNetworkJSON := flag.Bool("json", false, "emit node-network machine-readable output")
 	flag.Parse()
+	if *mode == "node-network" {
+		if err := runNodeNetworkCLI(nodeNetworkCLIArgs(*nodeNetworkAction, *nodeNetworkConfig, *nodeNetworkArtifact, *nodeNetworkSHA256, *nodeNetworkJSON), os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if *mode == "systemd-render" {
 		if *systemdOutputDir != "" {
 			log.Fatal("--systemd-output-dir is not supported; systemd-render only writes to stdout")
@@ -776,7 +796,7 @@ func main() {
 		return
 	}
 	if *mode == "agent" {
-		runAgent(*url, *node, *token, *tokenFile, *usage, *applyHook, *rulesetState)
+		runAgent(*url, *node, *token, *tokenFile, *usage, *applyHook, *rulesetState, *nodeNetworkConfig)
 		return
 	}
 	if *mode == "nft" {
@@ -801,5 +821,5 @@ func main() {
 		runAdmin(*db, *adminFile)
 		return
 	}
-	log.Fatal("--mode must be server, agent, nft, nft-hook, restore, reconcile, admin, or systemd-render")
+	log.Fatal("--mode must be server, agent, nft, nft-hook, restore, reconcile, admin, systemd-render, or node-network")
 }

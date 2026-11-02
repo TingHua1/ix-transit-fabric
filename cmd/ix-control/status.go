@@ -259,9 +259,12 @@ func NodeStatusOnline(status NodeStatus, now time.Time, timeout time.Duration) b
 
 type agentStatusReporter struct {
 	rulesetState string
-	bootID       string
-	generation   int64
-	sequence     int64
+	// nodeNetworkConfig is optional. It is only locally checked; reporting never
+	// opens the referenced secret, contacts a peer, or runs a host command.
+	nodeNetworkConfig string
+	bootID            string
+	generation        int64
+	sequence          int64
 }
 
 type persistedStatusGeneration struct {
@@ -277,7 +280,7 @@ func statusGenerationPath(rulesetState string) (string, error) {
 	return rulesetState + ".status-generation", nil
 }
 
-func newAgentStatusReporter(rulesetState string) (*agentStatusReporter, error) {
+func newAgentStatusReporter(rulesetState string, nodeNetworkConfigs ...string) (*agentStatusReporter, error) {
 	statePath, err := statusGenerationPath(rulesetState)
 	if err != nil {
 		return nil, err
@@ -290,7 +293,11 @@ func newAgentStatusReporter(rulesetState string) (*agentStatusReporter, error) {
 	if _, err := rand.Read(boot); err != nil {
 		return nil, fmt.Errorf("generate status boot id: %w", err)
 	}
-	return &agentStatusReporter{rulesetState: rulesetState, bootID: hex.EncodeToString(boot), generation: generation}, nil
+	var nodeNetworkConfig string
+	if len(nodeNetworkConfigs) > 0 {
+		nodeNetworkConfig = nodeNetworkConfigs[0]
+	}
+	return &agentStatusReporter{rulesetState: rulesetState, nodeNetworkConfig: nodeNetworkConfig, bootID: hex.EncodeToString(boot), generation: generation}, nil
 }
 
 // incrementStatusGeneration serializes read/increment/write with an exclusive
@@ -373,6 +380,18 @@ func (r *agentStatusReporter) next() StatusReport {
 		EasyTier:     EasyTierStatus{State: "unknown", Detail: "not collected"},
 		Peers:        PeerSummary{State: "unknown"},
 		Error:        StatusErrorSummary{Code: "none"},
+	}
+	if r.nodeNetworkConfig != "" {
+		// The result remains deliberately unobserved: the status reporter is not
+		// a service probe. A rejected local declaration is mapped to the existing
+		// de-identified local_state_error vocabulary; neither its path nor the
+		// parse/permission failure can enter the wire report.
+		if _, err := loadLocalNodeNetworkConfig(r.nodeNetworkConfig); err != nil {
+			easy, tun, peers, statusErr := MapLocalNetworkSummary(LocalNetworkSummary{
+				ServiceState: "error", ReasonCode: "local_state_error",
+			})
+			report.EasyTier, report.Tun0, report.Peers, report.Error = easy, tun, peers, statusErr
+		}
 	}
 	if r.rulesetState == "" {
 		return report
