@@ -26,6 +26,7 @@ type RuleSpec struct {
 	TargetPort  uint16 `json:"target_port"`
 	MatchDAddr  string `json:"match_daddr,omitempty"`
 	Description string `json:"description,omitempty"`
+	NoMeter     bool   `json:"no_meter,omitempty"`
 }
 
 type Ruleset struct {
@@ -123,6 +124,9 @@ func renderNFT(rs Ruleset) (string, error) {
 	}
 	b.WriteString("  }\n  chain cp_forward { type filter hook forward priority filter; policy accept;\n")
 	for _, r := range rs.Rules {
+		if r.NoMeter {
+			continue
+		}
 		for _, p := range mustProtocols(r.Protocol) {
 			fmt.Fprintf(&b, "    ct status dnat ct direction original ip daddr %s %s dport %d counter comment \"%s\"\n", r.TargetIP, p, r.TargetPort, nftRuleComment(r.ID, p, "up"))
 			fmt.Fprintf(&b, "    ct status dnat ct direction reply ip saddr %s %s sport %d counter comment \"%s\"\n", r.TargetIP, p, r.TargetPort, nftRuleComment(r.ID, p, "down"))

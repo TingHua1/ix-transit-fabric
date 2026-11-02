@@ -7,6 +7,44 @@ import (
 	"time"
 )
 
+func testManagementDB(t *testing.T, name string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite3", "file:"+name+"?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initSchema(db); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := initManagementSchema(db); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO users VALUES('u1',1,0,0,'both'); INSERT INTO node_config VALUES('ing','ingress',''),('tran','transit','10.9.0.2');`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	return db
+}
+
+func testLink(id string, clientPort, transitPort uint16) LinkSpec {
+	return LinkSpec{ID: id, UserID: "u1", Enabled: true, Protocol: "tcp", ClientPort: clientPort, IngressNodeID: "ing", IngressPublicIP: "203.0.113.2", TransitNodeID: "tran", TransitEasyIP: "10.9.0.2", TransitPort: transitPort, LandingIP: "192.0.2.10", LandingPort: 443}
+}
+
+func latestRuleset(t *testing.T, db *sql.DB, nodeID string) Ruleset {
+	t.Helper()
+	var body string
+	if err := db.QueryRow(`SELECT body FROM commands WHERE node_id=? ORDER BY rowid DESC LIMIT 1`, nodeID).Scan(&body); err != nil {
+		t.Fatal(err)
+	}
+	var rs Ruleset
+	if err := json.Unmarshal([]byte(body), &rs); err != nil {
+		t.Fatal(err)
+	}
+	return rs
+}
+
 func TestActiveUserHonorsExpiryAndQuota(t *testing.T) {
 	db, err := sql.Open("sqlite3", "file:ixcontroladmin?mode=memory&cache=shared")
 	if err != nil {
@@ -78,6 +116,153 @@ func TestSyncNodeQueuesOnlyActiveRules(t *testing.T) {
 	}
 	if len(rs.Rules) != 1 || rs.Rules[0].ID != "a" {
 		t.Fatalf("unexpected active rules: %#v", rs.Rules)
+	}
+}
+
+func TestLinkAggregationAndTwoNodeExpansion(t *testing.T) {
+	db := testManagementDB(t, "ixcontrollinksaggregate")
+	defer db.Close()
+	if err := upsertLink(db, testLink("l1", 32001, 42001)); err != nil {
+		t.Fatal(err)
+	}
+	if err := upsertLink(db, testLink("l2", 32002, 42002)); err != nil {
+		t.Fatal(err)
+	}
+	ingress := latestRuleset(t, db, "ing")
+	if ingress.Role != "ingress" || len(ingress.Rules) != 2 || ingress.Rules[0].ID != "l1" || ingress.Rules[1].ID != "l2" || ingress.Rules[0].TargetIP != "10.9.0.2" || ingress.Rules[0].MatchDAddr != "203.0.113.2" {
+		t.Fatalf("unexpected ingress ruleset: %#v", ingress)
+	}
+	transit := latestRuleset(t, db, "tran")
+	if transit.Role != "transit" || len(transit.Rules) != 2 || transit.Rules[0].ID != "t-l1" || transit.Rules[1].ID != "t-l2" || transit.Rules[0].TargetIP != "192.0.2.10" {
+		t.Fatalf("unexpected transit ruleset: %#v", transit)
+	}
+}
+
+func TestLinkInactiveUsersDoNotGenerateRules(t *testing.T) {
+	db := testManagementDB(t, "ixcontrollinksinactive")
+	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO users VALUES('off',0,0,0,'both'),('expired',1,1,0,'both'),('full',1,0,10,'both');`); err != nil {
+		t.Fatal(err)
+	}
+	links := []LinkSpec{testLink("off-link", 32101, 42101), testLink("expired-link", 32102, 42102), testLink("full-link", 32103, 42103)}
+	links[0].UserID, links[1].UserID, links[2].UserID = "off", "expired", "full"
+	for _, l := range links {
+		if err := upsertLink(db, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO usage_events VALUES('ing','full-link',1,5,5,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncNode(db, "ing"); err != nil {
+		t.Fatal(err)
+	}
+	if got := latestRuleset(t, db, "ing"); len(got.Rules) != 0 {
+		t.Fatalf("inactive links must not be queued: %#v", got.Rules)
+	}
+}
+
+func TestLinkQueuesTransitBeforeIngress(t *testing.T) {
+	db := testManagementDB(t, "ixcontrollinkorder")
+	defer db.Close()
+	if err := upsertLink(db, testLink("order", 32201, 42201)); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(`SELECT node_id FROM commands ORDER BY rowid`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) != 2 || ids[0] != "tran" || ids[1] != "ing" {
+		t.Fatalf("expected transit then ingress, got %v", ids)
+	}
+}
+
+func TestReconcileAllQueuesTransitBeforeIngress(t *testing.T) {
+	db := testManagementDB(t, "ixcontrollinkreconcileorder")
+	defer db.Close()
+	if err := reconcileAll(db); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(`SELECT node_id FROM commands ORDER BY rowid`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) != 2 || ids[0] != "tran" || ids[1] != "ing" {
+		t.Fatalf("expected transit then ingress, got %v", ids)
+	}
+}
+
+func TestLinkRejectsProtocolPortConflicts(t *testing.T) {
+	db := testManagementDB(t, "ixcontrollinkconflicts")
+	defer db.Close()
+	if err := upsertLink(db, testLink("first", 32301, 42301)); err != nil {
+		t.Fatal(err)
+	}
+	conflict := testLink("both", 32301, 42302)
+	conflict.Protocol = "both"
+	if err := upsertLink(db, conflict); err == nil {
+		t.Fatal("both protocol must conflict with existing tcp listener")
+	}
+	if _, err := db.Exec(`INSERT INTO managed_rules VALUES('managed','ing','u1',1,'udp',32302,'192.0.2.20',53,'','')`); err != nil {
+		t.Fatal(err)
+	}
+	managedConflict := testLink("managed-link", 32302, 42303)
+	managedConflict.Protocol = "both"
+	if err := upsertLink(db, managedConflict); err == nil {
+		t.Fatal("link must conflict with managed rule selector")
+	}
+}
+
+func TestLinkUpdateDeleteRemoveOldRulesAndMeterOnlyIngress(t *testing.T) {
+	db := testManagementDB(t, "ixcontrollinkupdate")
+	defer db.Close()
+	l := testLink("metered", 32401, 42401)
+	if err := upsertLink(db, l); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO usage_events VALUES('ing','metered',1,3,7,1),('tran','t-metered',1,100,100,1)`); err != nil {
+		t.Fatal(err)
+	}
+	used, err := usageForUser(db, "u1", "both")
+	if err != nil || used != 10 {
+		t.Fatalf("link usage must count ingress only: used=%d err=%v", used, err)
+	}
+	l.ClientPort, l.TransitPort = 32402, 42402
+	if err := upsertLink(db, l); err != nil {
+		t.Fatal(err)
+	}
+	if got := latestRuleset(t, db, "ing"); len(got.Rules) != 1 || got.Rules[0].ListenPort != 32402 {
+		t.Fatalf("updated ingress ruleset retained old rule: %#v", got.Rules)
+	}
+	if got := latestRuleset(t, db, "tran"); len(got.Rules) != 1 || got.Rules[0].ListenPort != 42402 {
+		t.Fatalf("updated transit ruleset retained old rule: %#v", got.Rules)
+	}
+	if err := deleteLink(db, "metered"); err != nil {
+		t.Fatal(err)
+	}
+	if got := latestRuleset(t, db, "ing"); len(got.Rules) != 0 {
+		t.Fatalf("deleted ingress rule retained: %#v", got.Rules)
+	}
+	if got := latestRuleset(t, db, "tran"); len(got.Rules) != 0 {
+		t.Fatalf("deleted transit rule retained: %#v", got.Rules)
 	}
 }
 func containsText(s, sub string) bool {
