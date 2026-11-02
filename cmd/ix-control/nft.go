@@ -166,19 +166,6 @@ func renderNFT(rs Ruleset) (string, error) {
 }
 func mustProtocols(p string) []string { x, _ := protocols(p); return x }
 
-// A conservative text check blocks same selectors already owned by the legacy table.
-func legacyConflicts(nftText string, rs Ruleset) error {
-	for _, r := range rs.Rules {
-		for _, p := range mustProtocols(r.Protocol) {
-			needle := p + " dport " + strconv.Itoa(int(r.ListenPort))
-			if strings.Contains(nftText, needle) {
-				return fmt.Errorf("legacy table may already own %s; refusing overlap", needle)
-			}
-		}
-	}
-	return nil
-}
-
 func nftCheckAndApply(script string) error {
 	tmp, err := os.CreateTemp("", "ix-control-nft-*.nft")
 	if err != nil {
@@ -215,11 +202,6 @@ func applyRulesetCommand(c Command) (bool, string) {
 	script, err := renderNFT(rs)
 	if err != nil {
 		return false, err.Error()
-	}
-	if out, err := exec.Command("nft", "list", "table", "ip", "ix_transit_fabric").CombinedOutput(); err == nil {
-		if err := legacyConflicts(string(out), rs); err != nil {
-			return false, err.Error()
-		}
 	}
 	if err := nftCheckAndApply(script); err != nil {
 		return false, err.Error()
@@ -385,6 +367,9 @@ func saveRuleset(path string, rs json.RawMessage) error {
 func restoreRuleset(path string) error {
 	state, err := loadRulesetState(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		return err
 	}
 	script, err := renderNFT(state.Ruleset)

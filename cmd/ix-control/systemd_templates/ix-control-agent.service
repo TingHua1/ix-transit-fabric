@@ -1,0 +1,29 @@
+[Unit]
+Description=ix-control node agent
+After=network-online.target ix-control-restore.service
+Requires=ix-control-restore.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@STATE_DIR@
+StateDirectory=ix-control
+StateDirectoryMode=0700
+UMask=0077
+# The token file is local input and must be mode 0600; no token is embedded here.
+ExecStart=@IX_CONTROL_BIN@ --mode agent --server @SERVER_URL@ --node-id @NODE_ID@ --token-file @TOKEN_FILE@ --usage-file @STATE_DIR@/usage.ndjson --ruleset-state @STATE_DIR@/ruleset.json
+Restart=on-failure
+RestartSec=5s
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=@STATE_DIR@
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

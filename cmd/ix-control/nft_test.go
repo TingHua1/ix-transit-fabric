@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -59,13 +60,13 @@ func TestRulesetHashAndAgentVersionDecision(t *testing.T) {
 		t.Fatalf("new version decision=%v %q", apply, detail)
 	}
 }
-func TestLegacyConflict(t *testing.T) {
-	rs := Ruleset{Role: "ingress", Rules: []RuleSpec{{ID: "one", Protocol: "tcp", ListenPort: 30000, TargetIP: "1.1.1.1", TargetPort: 443}}}
-	if err := legacyConflicts("tcp dport 30000 dnat to 1.1.1.1:443", rs); err == nil {
-		t.Fatal("expected overlap rejection")
-	}
-	if err := legacyConflicts("udp dport 30000 dnat to 1.1.1.1:443", rs); err != nil {
+func TestApplyRulesetDoesNotReferenceLegacyTable(t *testing.T) {
+	source, err := os.ReadFile("nft.go")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if strings.Contains(string(source), "ix_"+"transit_fabric") {
+		t.Fatal("apply ruleset source must not reference the legacy nft table")
 	}
 }
 func TestParseCounterJSON(t *testing.T) {
@@ -79,5 +80,19 @@ func TestParseCounterJSON(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("unexpected counters %#v", got)
+	}
+}
+
+func TestRestoreRulesetMissingStateIsNoopButInvalidStateFails(t *testing.T) {
+	missing := t.TempDir() + "/missing-ruleset-state.json"
+	if err := restoreRuleset(missing); err != nil {
+		t.Fatalf("missing state must be a no-op: %v", err)
+	}
+	state := t.TempDir() + "/ruleset.json"
+	if err := os.WriteFile(state, []byte("not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreRuleset(state); err == nil {
+		t.Fatal("invalid state unexpectedly restored")
 	}
 }

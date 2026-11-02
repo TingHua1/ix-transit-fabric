@@ -1,0 +1,23 @@
+[Unit]
+Description=ix-control controller reconciliation
+After=ix-control-server.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=@STATE_DIR@
+StateDirectory=ix-control
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=@IX_CONTROL_BIN@ --mode reconcile --db @DB_DSN@
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=@STATE_DIR@
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX

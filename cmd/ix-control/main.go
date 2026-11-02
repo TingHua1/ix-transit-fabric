@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,12 +82,48 @@ func must(err error) {
 }
 
 func openDB(path string) *sql.DB {
-	must(os.MkdirAll(filepath.Dir(path), 0700))
-	db, err := sql.Open("sqlite3", path+"?_busy_timeout=5000&_journal_mode=WAL")
+	dsn, dbPath := sqliteDSN(path)
+	if dbPath != "" {
+		must(os.MkdirAll(filepath.Dir(dbPath), 0700))
+	}
+	db, err := sql.Open("sqlite3", dsn)
 	must(err)
 	must(db.Ping())
 	must(initSchema(db))
 	return db
+}
+
+// sqliteDSN preserves caller supplied SQLite options while supplying the
+// defaults required by the controller. In particular, file DSNs that already
+// have a query string use '&', never a second '?'.
+func sqliteDSN(dsn string) (string, string) {
+	base, query, hasQuery := strings.Cut(dsn, "?")
+	values, _ := url.ParseQuery(query)
+	missing := make([]string, 0, 2)
+	if _, ok := values["_busy_timeout"]; !ok {
+		missing = append(missing, "_busy_timeout=5000")
+	}
+	if _, ok := values["_journal_mode"]; !ok {
+		missing = append(missing, "_journal_mode=WAL")
+	}
+	if len(missing) > 0 {
+		separator := "?"
+		if hasQuery {
+			separator = "&"
+		}
+		dsn += separator + strings.Join(missing, "&")
+	}
+	if !strings.HasPrefix(base, "file:") {
+		return dsn, base
+	}
+	if base == "file::memory:" || values.Get("mode") == "memory" {
+		return dsn, ""
+	}
+	fileURL, err := url.Parse(base)
+	if err != nil || fileURL.Path == "" {
+		return dsn, ""
+	}
+	return dsn, fileURL.Path
 }
 
 func initSchema(db *sql.DB) error {
@@ -133,7 +170,15 @@ CREATE TABLE IF NOT EXISTS node_ruleset_state (
    desired_version INTEGER NOT NULL DEFAULT 0,
    desired_hash TEXT NOT NULL DEFAULT '',
    applied_version INTEGER NOT NULL DEFAULT 0,
-   applied_hash TEXT NOT NULL DEFAULT ''
+    applied_hash TEXT NOT NULL DEFAULT ''
+ );
+CREATE TABLE IF NOT EXISTS node_status (
+   node_id TEXT PRIMARY KEY,
+   boot_id TEXT NOT NULL,
+   generation INTEGER NOT NULL,
+   sequence INTEGER NOT NULL,
+   received_at INTEGER NOT NULL,
+   report TEXT NOT NULL
 );
 `)
 	if err != nil {
@@ -153,7 +198,92 @@ CREATE TABLE IF NOT EXISTS node_ruleset_state (
 			return e
 		}
 	}
+	if err := migrateNodeStatusGeneration(db); err != nil {
+		return err
+	}
 	return nil
+}
+
+// migrateNodeStatusGeneration recognizes every pre-generation node_status
+// shape. Existing status is retained at generation zero; GetNodeStatus treats
+// those rows as historical-only compatibility data, and the first persistent
+// local generation (one) always supersedes them.
+func migrateNodeStatusGeneration(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(node_status)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	hasGeneration := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == "generation" {
+			hasGeneration = true
+		}
+	}
+	if err := rows.Err(); err != nil || hasGeneration {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`ALTER TABLE node_status RENAME TO node_status_legacy_generation`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE node_status (
+   node_id TEXT PRIMARY KEY,
+   boot_id TEXT NOT NULL,
+   generation INTEGER NOT NULL,
+   sequence INTEGER NOT NULL,
+   received_at INTEGER NOT NULL,
+   report TEXT NOT NULL
+)`); err != nil {
+		return err
+	}
+	rows, err = tx.Query(`SELECT node_id,boot_id,sequence,received_at,report FROM node_status_legacy_generation`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nodeID, bootID, report string
+		var sequence, receivedAt int64
+		if err := rows.Scan(&nodeID, &bootID, &sequence, &receivedAt, &report); err != nil {
+			return err
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(report), &payload); err != nil {
+			return fmt.Errorf("decode legacy node status: %w", err)
+		}
+		delete(payload, "boot_epoch")
+		// Both the row and its diagnostic JSON are historical generation zero.
+		payload["generation"] = 0
+		updated, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO node_status(node_id,boot_id,generation,sequence,received_at,report) VALUES(?,?,?,?,?,?)`, nodeID, bootID, 0, sequence, receivedAt, string(updated)); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE node_status_legacy_generation`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Server) authenticate(h Hello) error {
@@ -224,6 +354,18 @@ func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
 			}
 			n, _ := result.RowsAffected()
 			_ = conn.WriteJSON(Message{Type: "usage_ack", Data: mustJSON(map[string]any{"rule_id": u.RuleID, "sequence": u.Sequence, "accepted": n == 1})})
+		case "status_report":
+			report, err := decodeStatusReport(m.Data)
+			if err != nil {
+				_ = conn.WriteJSON(Message{Type: "error", Data: json.RawMessage(`"invalid status report"`)})
+				continue
+			}
+			accepted, err := s.recordStatus(hello.NodeID, report)
+			if err != nil {
+				_ = conn.WriteJSON(Message{Type: "error", Data: json.RawMessage(`"status write failed"`)})
+				continue
+			}
+			_ = conn.WriteJSON(Message{Type: "status_ack", Data: mustJSON(map[string]any{"boot_id": report.BootID, "sequence": report.Sequence, "accepted": accepted})})
 		case "poll":
 			commands, err := s.pendingCommands(hello.NodeID)
 			if err != nil {
@@ -415,6 +557,10 @@ func runAgent(serverURL, nodeID, token, tokenFile, usageFile, applyHook, ruleset
 	if nodeID == "" || token == "" {
 		log.Fatal("--node-id and --token or --token-file are required")
 	}
+	reporter, err := newAgentStatusReporter(rulesetState)
+	if err != nil {
+		log.Fatalf("initialize persistent local status generation: %v", err)
+	}
 	for {
 		conn, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
 		if err != nil {
@@ -438,7 +584,7 @@ func runAgent(serverURL, nodeID, token, tokenFile, usageFile, applyHook, ruleset
 			continue
 		}
 		log.Printf("connected to control-plane as %s", nodeID)
-		if err := agentSession(conn, nodeID, usageFile, applyHook, rulesetState); err != nil {
+		if err := agentSession(conn, nodeID, usageFile, applyHook, rulesetState, reporter); err != nil {
 			log.Printf("agent reconnect: %v", err)
 		}
 		conn.Close()
@@ -448,12 +594,34 @@ func runAgent(serverURL, nodeID, token, tokenFile, usageFile, applyHook, ruleset
 
 // Usage input is newline-delimited JSON Usage objects. Producers append only
 // deltas, with a monotonic sequence per node/rule. Accepted entries are removed.
-func agentSession(conn *websocket.Conn, nodeID, usageFile, applyHook, rulesetState string) error {
+func agentSession(conn *websocket.Conn, nodeID, usageFile, applyHook, rulesetState string, reporter *agentStatusReporter) error {
 	tick := time.NewTicker(30 * time.Second)
 	defer tick.Stop()
+	reportStatus := func() error {
+		report := reporter.next()
+		if err := conn.WriteJSON(Message{Type: "status_report", Data: mustJSON(report)}); err != nil {
+			return err
+		}
+		var ack Message
+		if err := conn.ReadJSON(&ack); err != nil {
+			return err
+		}
+		if ack.Type != "status_ack" {
+			return fmt.Errorf("unexpected status acknowledgement response: %s", ack.Type)
+		}
+		return nil
+	}
+	// Report immediately after authentication, then keep status and the existing
+	// usage/command work on the same periodic tick.
+	if err := reportStatus(); err != nil {
+		return err
+	}
 	for {
 		select {
 		case <-tick.C:
+			if err := reportStatus(); err != nil {
+				return err
+			}
 			for _, u := range readUsage(usageFile, nodeID) {
 				if err := conn.WriteJSON(Message{Type: "usage", Data: mustJSON(u)}); err != nil {
 					return err
@@ -561,7 +729,7 @@ func markUsageAcked(path string, accepted Usage) {
 }
 
 func main() {
-	mode := flag.String("mode", "server", "server, agent, nft, nft-hook, restore, reconcile, or admin")
+	mode := flag.String("mode", "server", "server, agent, nft, nft-hook, restore, reconcile, admin, or systemd-render")
 	addr := flag.String("listen", "127.0.0.1:8787", "server listen address")
 	db := flag.String("db", "./ix-control.db", "sqlite database")
 	url := flag.String("server", "", "control websocket URL")
@@ -574,7 +742,35 @@ func main() {
 	collectorState := flag.String("collector-state", "", "collector state file for nft mode")
 	rulesetState := flag.String("ruleset-state", "/var/lib/ix-control/ruleset.json", "persisted authorized ruleset path")
 	adminFile := flag.String("admin-file", "", "management request JSON for admin mode")
+	systemdRole := flag.String("systemd-role", "", "systemd-render role: node or controller")
+	systemdOutputDir := flag.String("systemd-output-dir", "", "deprecated; systemd-render only writes to stdout")
+	systemdBinary := flag.String("systemd-binary", "/usr/local/bin/ix-control", "systemd-render ix-control binary path")
+	systemdStateDir := flag.String("systemd-state-dir", SystemdStateDir, "systemd-render state directory")
+	systemdDBDSN := flag.String("systemd-db-dsn", "file:/var/lib/ix-control/ix-control.db?_busy_timeout=5000&_journal_mode=WAL", "systemd-render SQLite file DSN")
+	systemdTokenFileMode := flag.String("systemd-token-file-mode", "0600", "systemd-render declared token-file mode; must be 0600")
 	flag.Parse()
+	if *mode == "systemd-render" {
+		if *systemdOutputDir != "" {
+			log.Fatal("--systemd-output-dir is not supported; systemd-render only writes to stdout")
+		}
+		tokenMode, err := ParseSystemdTokenFileMode(*systemdTokenFileMode)
+		if err != nil {
+			log.Fatal(err)
+		}
+		in := SystemdRenderInput{
+			BinaryPath:    *systemdBinary,
+			NodeID:        *node,
+			ServerURL:     *url,
+			TokenFile:     *tokenFile,
+			TokenFileMode: tokenMode,
+			StateDir:      *systemdStateDir,
+			DatabaseDSN:   *systemdDBDSN,
+		}
+		if err := GenerateSystemdTemplates(SystemdRole(*systemdRole), in, "", os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if *mode == "server" {
 		runServer(*addr, *db)
 		return
@@ -605,5 +801,5 @@ func main() {
 		runAdmin(*db, *adminFile)
 		return
 	}
-	log.Fatal("--mode must be server, agent, nft, nft-hook, or admin")
+	log.Fatal("--mode must be server, agent, nft, nft-hook, restore, reconcile, admin, or systemd-render")
 }

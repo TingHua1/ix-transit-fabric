@@ -1,0 +1,25 @@
+[Unit]
+Description=ix-control loopback controller
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@STATE_DIR@
+StateDirectory=ix-control
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=@IX_CONTROL_BIN@ --mode server --listen 127.0.0.1:8787 --db @DB_DSN@
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=@STATE_DIR@
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET

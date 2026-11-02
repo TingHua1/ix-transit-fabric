@@ -22,3 +22,4 @@ local.env
 .cursor/kc-mcp/
 .cursor/kc-mcp-messages/
 .cursor/kc-chat-exports/
+.slim/deepwork/

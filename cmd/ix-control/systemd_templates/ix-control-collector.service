@@ -1,0 +1,24 @@
+[Unit]
+Description=ix-control local counter collector
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=@STATE_DIR@
+StateDirectory=ix-control
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=@IX_CONTROL_BIN@ --mode nft --collector-state @STATE_DIR@/collector-state.json --usage-file @STATE_DIR@/usage.ndjson --node-id @NODE_ID@
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=@STATE_DIR@
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
